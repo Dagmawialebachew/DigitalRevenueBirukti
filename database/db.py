@@ -1,20 +1,52 @@
+import asyncio
 import os
+import time
 import asyncpg
 from typing import Optional, Dict, Any, List
 from config import settings
 
+
 class Database:
     def __init__(self):
         self.pool: Optional[asyncpg.Pool] = None
+        # Ultra-fast write-through cache for member records (avoids redundant Neon roundtrips)
+        self._athlete_cache: Dict[int, tuple[float, Dict[str, Any]]] = {}
+        self._cache_ttl: float = 120.0
+
+    def _get_cached_athlete(self, telegram_id: int) -> Optional[Dict[str, Any]]:
+        entry = self._athlete_cache.get(telegram_id)
+        if not entry:
+            return None
+        ts, data = entry
+        if (time.monotonic() - ts) > self._cache_ttl:
+            self._athlete_cache.pop(telegram_id, None)
+            return None
+        return dict(data)
+
+    def _set_cached_athlete(self, telegram_id: int, row: Dict[str, Any]):
+        if len(self._athlete_cache) > 5000:
+            self._athlete_cache.clear()
+        self._athlete_cache[telegram_id] = (time.monotonic(), dict(row))
 
     async def connect(self):
         if not self.pool:
-            self.pool = await asyncpg.create_pool(
-                dsn=settings.DATABASE_URL,
-                min_size=5,
-                max_size=25
-            )
-            await self.init_tables()
+            last_err = None
+            for attempt in range(1, 4):
+                try:
+                    self.pool = await asyncpg.create_pool(
+                        dsn=settings.DATABASE_URL,
+                        min_size=2,
+                        max_size=15,
+                        statement_cache_size=0,  # Required for Neon PgBouncer transaction poolers
+                    )
+                    async with self.pool.acquire() as conn:
+                        await conn.fetchval("SELECT 1;")
+                    return
+                except Exception as e:
+                    last_err = e
+                    if attempt < 3:
+                        await asyncio.sleep(2)
+            raise last_err
 
     async def init_tables(self):
         schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
@@ -28,13 +60,14 @@ class Database:
         if self.pool:
             await self.pool.close()
             self.pool = None
+        self._athlete_cache.clear()
 
     # Athlete operations
     async def upsert_athlete(
         self,
         telegram_id: int,
         full_name: str,
-        username: Optional[str] = None
+        username: Optional[str] = None,
     ) -> Dict[str, Any]:
         query = """
         INSERT INTO athletes (telegram_id, full_name, username, onboarding_state)
@@ -47,29 +80,62 @@ class Database:
         """
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(query, telegram_id, full_name, username)
-            return dict(row)
+            result = dict(row)
+            self._set_cached_athlete(telegram_id, result)
+            return result
 
-    async def update_athlete_field(self, telegram_id: int, field: str, value: Any):
+    async def update_athlete_field(self, telegram_id: int, field: str, value: Any) -> Optional[Dict[str, Any]]:
+        return await self.update_athlete_fields(telegram_id, **{field: value})
+
+    async def update_athlete_fields(self, telegram_id: int, **fields: Any) -> Optional[Dict[str, Any]]:
+        """Update one or more athlete columns in a single DB roundtrip and refresh cache."""
         allowed_fields = {
-            "gender", "age", "weight_kg", "primary_goal",
-            "days_per_week", "experience_level", "onboarding_state"
+            "gender", "age", "age_range", "weight_kg", "primary_goal",
+            "days_per_week", "experience_level", "onboarding_state",
         }
-        if field not in allowed_fields:
-            raise ValueError(f"Invalid athlete field: {field}")
-        
+        invalid = set(fields.keys()) - allowed_fields
+        if invalid:
+            raise ValueError(f"Invalid athlete field(s): {invalid}")
+        if not fields:
+            return await self.get_athlete(telegram_id)
+
+        assignments = []
+        values = []
+        idx = 1
+        for col, val in fields.items():
+            assignments.append(f"{col} = ${idx}")
+            values.append(val)
+            idx += 1
+        assignments.append("last_interaction = CURRENT_TIMESTAMP")
+        values.append(telegram_id)
+
         query = f"""
         UPDATE athletes
-        SET {field} = $1, last_interaction = CURRENT_TIMESTAMP
-        WHERE telegram_id = $2;
+        SET {', '.join(assignments)}
+        WHERE telegram_id = ${idx}
+        RETURNING *;
         """
         async with self.pool.acquire() as conn:
-            await conn.execute(query, value, telegram_id)
+            row = await conn.fetchrow(query, *values)
+            if row:
+                result = dict(row)
+                self._set_cached_athlete(telegram_id, result)
+                return result
+            return None
 
-    async def get_athlete(self, telegram_id: int) -> Optional[Dict[str, Any]]:
+    async def get_athlete(self, telegram_id: int, bypass_cache: bool = False) -> Optional[Dict[str, Any]]:
+        if not bypass_cache:
+            cached = self._get_cached_athlete(telegram_id)
+            if cached is not None:
+                return cached
         query = "SELECT * FROM athletes WHERE telegram_id = $1;"
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(query, telegram_id)
-            return dict(row) if row else None
+            if row:
+                result = dict(row)
+                self._set_cached_athlete(telegram_id, result)
+                return result
+            return None
 
     # Catalog & Order operations
     async def get_catalog_product(self, gender: str, goal: str, days_per_week: int) -> Optional[Dict[str, Any]]:
@@ -101,7 +167,7 @@ class Database:
         goal: str,
         days_per_week: int,
         price_etb: int,
-        pdf_path: str
+        pdf_path: str,
     ):
         query = """
         INSERT INTO workout_catalog (sku, title, gender, goal, days_per_week, price_etb, pdf_path, is_active)
@@ -123,7 +189,7 @@ class Database:
         athlete_id: int,
         sku: str,
         amount_etb: int,
-        payment_method: str = "CBE"
+        payment_method: str = "CBE",
     ) -> Dict[str, Any]:
         query = """
         INSERT INTO orders (order_id, athlete_id, sku, amount_etb, payment_method, status)
@@ -138,7 +204,7 @@ class Database:
         self,
         order_id: str,
         receipt_file_id: str,
-        txn_ref: Optional[str] = None
+        txn_ref: Optional[str] = None,
     ):
         query = """
         UPDATE orders
@@ -168,10 +234,6 @@ class Database:
             return dict(row) if row else None
 
     async def check_txn_replay(self, txn_ref: str) -> Optional[Dict[str, Any]]:
-        """
-        Returns any existing completed order with the same transaction reference
-        to prevent receipt replay attacks.
-        """
         if not txn_ref:
             return None
         query = """
@@ -205,14 +267,14 @@ class Database:
             rows = await conn.fetch(query, athlete_id)
             return [dict(r) for r in rows]
 
-    # Check-in operations (Post-purchase 8-week progress tracking)
+    # Check-in operations
     async def record_checkin(
         self,
         athlete_id: int,
         week_number: int,
         weight_kg: float,
         workouts_completed: int,
-        notes: Optional[str] = None
+        notes: Optional[str] = None,
     ) -> Dict[str, Any]:
         query = """
         INSERT INTO athlete_checkins (athlete_id, week_number, weight_kg, workouts_completed, notes)
@@ -246,9 +308,6 @@ class Database:
 
     # Funnel & Performance Analytics
     async def get_funnel_metrics(self) -> Dict[str, Any]:
-        """
-        Aggregates visitors across each funnel stage and conversion metrics.
-        """
         query_states = """
         SELECT onboarding_state, COUNT(*) as user_count
         FROM athletes
@@ -274,12 +333,45 @@ class Database:
             "order_counts": order_counts,
             "delivered_orders": order_counts.get("DELIVERED", 0) + order_counts.get("VERIFIED", 0),
             "pending_receipts": order_counts.get("PENDING", 0),
-            "total_revenue_etb": total_revenue
+            "total_revenue_etb": total_revenue,
+        }
+
+    async def get_admin_dashboard_stats(self) -> Dict[str, Any]:
+        """Single fast roundtrip aggregating daily & lifetime metrics for /admin."""
+        query = """
+        SELECT
+            (SELECT COUNT(*) FROM athletes) AS total_users,
+            (SELECT COUNT(*) FROM athletes WHERE created_at >= CURRENT_DATE) AS today_users,
+            (SELECT COUNT(*) FROM orders WHERE status IN ('VERIFIED', 'DELIVERED')) AS paid_sales,
+            (SELECT COUNT(*) FROM orders WHERE status IN ('VERIFIED', 'DELIVERED') AND COALESCE(verified_at, created_at) >= CURRENT_DATE) AS today_sales,
+            (SELECT COUNT(*) FROM orders WHERE status = 'PENDING' AND receipt_file_id IS NOT NULL) AS pending_receipts,
+            (SELECT COUNT(*) FROM orders WHERE status = 'PENDING' AND receipt_file_id IS NULL) AS pending_checkouts,
+            (SELECT COALESCE(SUM(gross_amount), 0) FROM payout_ledger) AS gross_revenue,
+            (SELECT COALESCE(SUM(gross_amount), 0) FROM payout_ledger WHERE created_at >= CURRENT_DATE) AS today_revenue,
+            (SELECT COALESCE(SUM(creator_share), 0) FROM payout_ledger) AS creator_earnings,
+            (SELECT COALESCE(SUM(platform_share), 0) FROM payout_ledger) AS platform_earnings,
+            (SELECT COALESCE(SUM(creator_share), 0) FROM payout_ledger WHERE settlement_status = 'UNSETTLED') AS unsettled_balance;
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(query)
+        d = dict(row)
+        return {
+            "total_users": int(d.get("total_users") or 0),
+            "today_users": int(d.get("today_users") or 0),
+            "paid_sales": int(d.get("paid_sales") or 0),
+            "today_sales": int(d.get("today_sales") or 0),
+            "pending_receipts": int(d.get("pending_receipts") or 0),
+            "pending_checkouts": int(d.get("pending_checkouts") or 0),
+            "gross_revenue": float(d.get("gross_revenue") or 0),
+            "today_revenue": float(d.get("today_revenue") or 0),
+            "creator_earnings": float(d.get("creator_earnings") or 0),
+            "platform_earnings": float(d.get("platform_earnings") or 0),
+            "unsettled_balance": float(d.get("unsettled_balance") or 0),
         }
 
     async def get_recent_athletes(self, limit: int = 20) -> List[Dict[str, Any]]:
         query = """
-        SELECT a.*, 
+        SELECT a.*,
                (SELECT status FROM orders o WHERE o.athlete_id = a.telegram_id ORDER BY created_at DESC LIMIT 1) as latest_order_status
         FROM athletes a
         ORDER BY a.last_interaction DESC
@@ -304,14 +396,21 @@ class Database:
         SET onboarding_state = 'START',
             gender = NULL,
             age = NULL,
+            age_range = NULL,
             weight_kg = NULL,
             primary_goal = NULL,
             days_per_week = NULL,
             experience_level = NULL,
             last_interaction = CURRENT_TIMESTAMP
-        WHERE telegram_id = $1;
+        WHERE telegram_id = $1
+        RETURNING *;
         """
         async with self.pool.acquire() as conn:
-            await conn.execute(query, telegram_id)
+            row = await conn.fetchrow(query, telegram_id)
+            if row:
+                self._set_cached_athlete(telegram_id, dict(row))
+            else:
+                self._athlete_cache.pop(telegram_id, None)
+
 
 db = Database()

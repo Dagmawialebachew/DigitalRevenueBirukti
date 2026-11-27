@@ -1,25 +1,38 @@
 from decimal import Decimal
-from typing import Dict, Any, Optional, List
-import asyncpg
+from typing import Dict, Any
 from database.db import db
+
 
 async def record_verified_payout(order_id: str, amount_etb: int) -> Dict[str, Any]:
     """
-    Records a verified sale into the permanent payout ledger.
+    Atomically transitions a PENDING order to VERIFIED and records its payout split
+    into payout_ledger. Prevents double-payouts on concurrent admin button clicks.
     Sales 1-150: 60% Biruktawit / 40% Platform
     Sales 151+:  70% Biruktawit / 30% Platform
-    Past records are immutable and never retroactively recalculated.
     """
     async with db.pool.acquire() as conn:
         async with conn.transaction():
-            # 1. Total historical completed sales count
+            # 1. Atomic status lock: only one caller can move PENDING -> VERIFIED
+            locked = await conn.fetchrow(
+                """
+                UPDATE orders
+                SET status = 'VERIFIED', verified_at = CURRENT_TIMESTAMP
+                WHERE order_id = $1 AND status = 'PENDING'
+                RETURNING order_id, athlete_id, amount_etb;
+                """,
+                order_id
+            )
+            if not locked:
+                return {"already_processed": True}
+
+            # 2. Total historical completed sales count
             prior_sales = await conn.fetchval(
                 "SELECT COUNT(*) FROM payout_ledger;"
             )
             current_sale_num = prior_sales + 1
             gross = Decimal(amount_etb)
 
-            # 2. Threshold determination
+            # 3. Threshold determination
             if current_sale_num <= 150:
                 creator_pct = Decimal("0.60")
                 platform_pct = Decimal("0.40")
@@ -33,7 +46,7 @@ async def record_verified_payout(order_id: str, amount_etb: int) -> Dict[str, An
             platform_cut = (gross * platform_pct).quantize(Decimal("0.01"))
             payout_id = f"PAY-{current_sale_num:05d}"
 
-            # 3. Store permanent immutable record
+            # 4. Store permanent immutable record
             await conn.execute(
                 """
                 INSERT INTO payout_ledger (
@@ -46,17 +59,8 @@ async def record_verified_payout(order_id: str, amount_etb: int) -> Dict[str, An
                 creator_cut, platform_cut, tier_label
             )
 
-            # 4. Mark order as VERIFIED
-            await conn.execute(
-                """
-                UPDATE orders
-                SET status = 'VERIFIED', verified_at = CURRENT_TIMESTAMP
-                WHERE order_id = $1;
-                """,
-                order_id
-            )
-
             return {
+                "already_processed": False,
                 "payout_id": payout_id,
                 "sale_number": current_sale_num,
                 "tier": tier_label,
@@ -65,13 +69,14 @@ async def record_verified_payout(order_id: str, amount_etb: int) -> Dict[str, An
                 "platform_share": float(platform_cut)
             }
 
+
 async def get_creator_payout_summary() -> Dict[str, Any]:
     """
     Returns Biruktawit's earnings summary: total sales, cumulative earnings,
     unsettled payout balance, tier 1 vs tier 2 counts, and current threshold tier.
     """
     query = """
-    SELECT 
+    SELECT
         COUNT(*) as total_sales,
         COALESCE(SUM(gross_amount), 0) as total_gross,
         COALESCE(SUM(creator_share), 0) as total_creator_earnings,
@@ -87,7 +92,7 @@ async def get_creator_payout_summary() -> Dict[str, Any]:
         total_sales = data.get("total_sales", 0)
         current_tier = "TIER_1_60_40 (60% Creator)" if total_sales <= 150 else "TIER_2_70_30 (70% Creator)"
         sales_to_next_tier = max(0, 150 - total_sales)
-        
+
         return {
             "total_sales": total_sales,
             "total_gross_etb": float(data.get("total_gross", 0)),
@@ -100,10 +105,10 @@ async def get_creator_payout_summary() -> Dict[str, Any]:
             "sales_to_next_tier": sales_to_next_tier
         }
 
+
 async def settle_unsettled_payouts() -> Dict[str, Any]:
     """
     Marks all currently unsettled creator payouts as SETTLED.
-    Called when creator distribution is transferred.
     """
     query = """
     UPDATE payout_ledger

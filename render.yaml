@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: digitalrevenuebiruktawit
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: frankfurt
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: WEBHOOK_URL
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMIN_USER_IDS
+        sync: false
+      - key: ADMIN_NEWUSER_GID
+        sync: false
+      - key: ADMIN_PAYMENT_GID
+        sync: false
+      - key: ADMIN_ERROR_GID
+        sync: false
+      - key: CREATOR_NAME
+        value: "BIRUKTAWIT FIKRE"
+      - key: CREATOR_HANDLE
+        value: "@gebdaw"
+      - key: SUPPORT_BOT_USERNAME
+        value: "coachbiruktawitsupportbot"
+      - key: DEFAULT_PRICE_ETB
+        value: "950"
+      - key: CBE_ACCOUNT
+        sync: false
+      - key: CBE_ACCOUNT_HOLDER
+        value: "BIRUKTAWIT FIKRE"
+      - key: BOA_ACCOUNT
+        sync: false
+      - key: BOA_ACCOUNT_HOLDER
+        value: "BIRUKTAWIT FIKRE"

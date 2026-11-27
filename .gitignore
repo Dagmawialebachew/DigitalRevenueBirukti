@@ -1,0 +1,20 @@
+# Secrets & local environment
+.env
+.env.local
+.env.*.local
+
+# Python caches & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Logs & scratch
+*.log
+logs/
+scratch/
+.DS_Store
+Thumbs.db
